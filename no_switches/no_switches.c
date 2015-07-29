@@ -10,7 +10,7 @@
  *    use without other license)
  *
  *  adapted for mxmxmx layout; basically, this boils down to:
- *  RB6 is heartbeat (not RB5); RB5 is unused; the ADC is mapped as follows:
+ *  RB5 is unused (was: heartbeat/LED), as is RA8 (was: switch #1); the ADC is mapped as follows:
  *
  * cvpitch :: RB1
  * cvfb :: RA1
@@ -20,6 +20,11 @@
  * cvfmknob :: RB3 
  * cvfbknob :: RC1
  * cvpitchknob :: RB2
+ *
+ * heartbeat/LED top :: RB6
+ * neg. freq./LED bottom :: RB7
+ * switch (top) :: RA4
+ * switch (bottom) :: RB4
  */
 
 /*
@@ -175,6 +180,8 @@ volatile unsigned long final_phase_fm_feedback;
 volatile long phase_shift;
 volatile long phaselowpass;
 volatile char oldhardsync;
+volatile char _PHASEMOD;
+volatile char prevStateRA4;
 
 //     to make stuffing the ADC values easier, we use some DEFINEs:
 //     changed to reflect pins used (mxmxmx))
@@ -413,6 +420,7 @@ int main(int argc, char** argv) {
     long int quantum;
     zig = 0;
     iz = 0;
+    prevStateRA4 = 1;
                      //  0x1 = ~ 1/15 Hz (1 cycle per 15 seconds)
     quantum = 0x2400;   //  0x24000 = ~ 10 KHz; 0x35000 =~ 15 KHz
 
@@ -434,7 +442,7 @@ int main(int argc, char** argv) {
    // Pins RB6, and RB7 are the LED ports, RB5 is unused
     TRISBbits.TRISB6 = 0;  //  RB6 is heartbeat
     PORTBbits.RB6 = 1;
-    TRISBbits.TRISB7 = 0;  //  RB7 is negative phase
+    TRISBbits.TRISB7 = 0;  //  RB7 is negative frequency
     PORTBbits.RB7 = 1;
     TRISBbits.TRISB8 = 0;  //   Pin RB8 is SYNC OUT,
     TRISBbits.TRISB9 = 1;  //   Pin RB9 is SYNC IN.
@@ -524,7 +532,7 @@ int main(int argc, char** argv) {
     //      interrupts.   Things like calculations of various things that are
     //       dependent on the ADC and are needed every DAC tick but don't
     //        necessarily have to change every DAC tick are calculated here.
-    //     These are things like the RB6 "hearbeat" LED, RB6 neg Freq.
+    //     These are things like the RB6 "hearbeat" LED, RB7 neg Freq.
     //     RB8 and RB9 hard sync in and hard sync out, and the internals:
     //     curpitchval, curpitchincr, and curphasemod.
     //
@@ -540,7 +548,6 @@ int main(int argc, char** argv) {
                                              // each flash = ~3 MIP of slack
 #endif
 
-
 #define HEARTBEAT_WAVEPHASE
 #ifdef HEARTBEAT_WAVEPHASE
         //int bitson[16] = { 0,1,0,1,1,1,0,1,0,1,0,1,0,0,0,1 };
@@ -551,6 +558,9 @@ int main(int argc, char** argv) {
         // PORTBbits.RB6 =  0x3FF > (0x00000FFF & (curbasephase >> 20 ));
         PORTBbits.RB6 = 1;
         TRISBbits.TRISB6 = 0x3FF < (0x00000FFF & (curbasephase >> 20 ));
+        // for testing purposes, copy to RB7
+        PORTBbits.RB7 = 1;
+        TRISBbits.TRISB7 = 0x3FF < (0x00000FFF & (curbasephase >> 20 ));
         //TRISBbits.TRISB6 = bitson [ 0x0F & (curbasephase >> 28)];
 #endif
 
@@ -560,7 +570,13 @@ int main(int argc, char** argv) {
         PORTCbits.RC7 = 0;
 #endif
 
-
+//#define NON_LATCHING
+#ifdef NON_LATCHING
+        char _switch = PORTAbits.RA4; 
+        if(prevStateRA4 && !_switch) _PHASEMOD = ~_PHASEMOD & 1u; // toggle phase mod / resolutuion grinding
+        prevStateRA4 = _switch;
+#endif
+        
 #define BASELINE_CVPITCHINCR
 #ifdef BASELINE_CVPITCHINCR
     curpitchval = cvpitchknob + ( ( cvpitch) - 2048) ;
@@ -574,9 +590,9 @@ int main(int argc, char** argv) {
 #define BASELINE_CURFREQMOD
 #ifdef BASELINE_CURFREQMOD
     curfreqmod = cvfmknob * (cvfm- 2048) << 5;
-    //    Output RB6 high if we have negative frequency
-    PORTBbits.RB6 = 1;
-    TRISBbits.TRISB6 = curpitchincr + curfreqmod < 0 ? 0 : 1;
+    //    Output RB7 high if we have negative frequency
+    // PORTBbits.RB7 = 1;
+    // TRISBbits.TRISB7 = curpitchincr + curfreqmod < 0 ? 0 : 1;
 #endif
 
 #define BASELINE_HARDSYNC
@@ -606,9 +622,9 @@ int main(int argc, char** argv) {
 #ifdef BASELINE_CURPHASEMOD
     curphasemod = (((cvpm - 2048) * cvpmknob) >> 10);
                 //+ ((curphasemod ) / 2);
-    //   Output RB7 driven high if we have negative phase
-    PORTBbits.RB7 = 1;
-    TRISBbits.TRISB7 = curpitchincr + (curphasemod << 13) < 0 ? 0 : 1 ;
+    // Output RB7 driven high if we have negative phase
+    // PORTBbits.RB7 = 1;
+    // TRISBbits.TRISB7 = curpitchincr + (curphasemod << 13) < 0 ? 0 : 1 ;
 #endif
 
     //
