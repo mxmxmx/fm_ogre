@@ -1,6 +1,9 @@
 # fm_ogre
 
-## wsy fm operator.
+## wsy fm operator
+
+### 6HP eurorack layout
+
 
 see [here](https://www.muffwiggler.com/forum/viewtopic.php?t=97630&start=650) and esp. [here](https://www.muffwiggler.com/forum/viewtopic.php?t=134469)
 
