@@ -3,29 +3,13 @@
  * Author: wsy
  *
  * Created on August 16, 2013, 7:10 AM
+ * Updated April 18 2015, 23:52 PM
+ * 
  *    This file is Copyright 2013 William S. Yerazunis,
  *   It is licensed CC-BY-SA-NC
  *
  *   (creative commons, attribute source, share alike, no commercial
  *    use without other license)
- *
- *
- *  adapted for mxmxmx layout; basically, this boils down to:
- *  RB5 is unused (was: heartbeat/LED), as is RA8 (was: switch #1); the ADC is mapped as follows:
- *
- *  cvpitch :: RB1
- *  cvfb :: RA1
- *  cvfm :: RB0
- *  cvpm :: RA0
- *  cvpmknob :: RC0
- *  cvfmknob :: RB3 
- *  cvfbknob :: RC1
- *  cvpitchknob :: RB2
- *
- *  heartbeat/LED top :: RB6
- *  neg. freq (?) / LED bottom :: RB7
- *  switch (top) :: RA4
- *  switch (bottom) :: RB4
  */
 
 /*
@@ -46,12 +30,13 @@
  *     - digital inputs:
  *          RA2 (30):   (also crystal in)
  *          RA3 (31):   (also crystal out)  ???  if low, use RA2 as 7.37MHz osc in ???
- *          RB4 (33):
- *          RA4 (34):
+ *          RA8 (32):   unused / mxmxmx layout
+ *          RB4 (33):   Switch 2 (external 100K pullup)
+ *          RA4 (34):   Switch 3 (external 100K pullup)
  *          pin 17,28,40: Vdd (+3.3v)
- *          RB5 (41): / PGED3 (5Vtol)  unused
- *          RB6 (42): / PGEC3 (5Vtol)  idle hearbeat
- *          RB7 (43):         (5Vtol)  negative phase
+ *          RB5 (41):   unused / mxmxmx layout
+ *          RB6 (42): / PGEC3 (5Vtol)  heartbeat (mxmxmx)
+ *          RB7 (43):         (5Vtol)  negative frequency (mxmxmx)
  *          RB8 (44):         (5Vtol)  Sync Out (25% duty cycle pulse train)
  *          RB9  (1):         (5Vtol)  Sync In
  *          pins 6, 16, 29, 39: Vss (ground)
@@ -106,6 +91,7 @@
 #include <p33FJ128GP804.h>
 //#include "common.h"
 #include "dsp.h"
+#include <stdint.h>
 
 // DSPIC33FJ64GP802 Configuration Bit Settings
 
@@ -163,25 +149,30 @@ _FOSC (POSCMD_XT & OSCIOFNC_OFF & IOL1WAY_OFF & FCKSM_CSECME)
 #pragma config JTAGEN = OFF             // JTAG Port Enable (JTAG is Disabled)
 
 
+//     Now for our actual application specific stuff
+//      Testing variables
 volatile unsigned long iz;
 volatile unsigned long zig;
 volatile unsigned long zurg;
+
 //     FM state variables
 volatile unsigned long curbasephase;
 volatile long curpitchval;
 volatile long curpitchincr;
 volatile long curfreqmod;
 volatile long curphasemod;
+volatile long curaltphasemod;
+volatile long curfbgain;
 //     AD converter stuff
 int which_adc;
 unsigned long sinevalue;
-volatile unsigned long final_phase_fm;
+volatile unsigned long final_phase_fm_fb_pm;
 volatile unsigned long final_phase_fmpm;
 volatile unsigned long final_phase_fm_feedback;
+volatile long dac1la, dac1lb;
 volatile long phase_shift;
 volatile long phaselowpass;
 volatile char oldhardsync;
-
 
 // switch / non-latching stuff
 
@@ -190,12 +181,12 @@ volatile char _SINE_SAMPLE;
 char prevStateRA4;  // track state, top switch
 char prevStateRB4;  // ditto, bottom switch 
 int  cnt_sw; // counter
-#define _CHECK  1000 // check every .. 
+#define _CHECK 5000 // check every .. 
 
 
 //     to make stuffing the ADC values easier, we use some DEFINEs:
-//     changed to reflect pins used (mxmxmx))
 volatile unsigned long cvdata[12];
+// remap ADC for 6HP layout:
 #define cvpitch (cvdata[3]) // RB1
 #define cvfb (cvdata[1]) // RA1
 #define cvfm (cvdata[2]) // RB0
@@ -206,12 +197,17 @@ volatile unsigned long cvdata[12];
 #define cvpitchknob (cvdata[4]) // RB2
 #define ADC_FIRST (0)
 #define ADC_LAST (7)
+#define PBUF_LEN 4096
+//   Unless we use __attribute__ ((far)) we would need to use large memory model for this to work.
+__attribute__ ((far)) unsigned int pbuf [PBUF_LEN];   
+volatile unsigned pbindex = 0;
 
 static short adc_inverted [8] = {1,1,1,1,0,0,0,0};
 //static short adc_sequence [16] = {0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7};
 
 //   Pins RB6, and RB7 are the LED port.
 //   Pin  RB8 is SYNC OUT, pin RB9 is SYNC IN.
+#define SYNC_IN (PORTBbits.RB9)
 //     The wavetable for sine waves are in wavetable.h
 #include "wavetable.h"
 
@@ -223,29 +219,22 @@ void __attribute__((__interrupt__,__auto_psv__)) _ADC1Interrupt(void)
     //                              //   Small race condition here - we
     //                              // grab the ADC data and stuff it into memory
     //
-//#define PRECHARGE_ADC
-#ifdef PRECHARGE_ADC
-    static short chargeonly ;
-    if (chargeonly )
-        {
-            chargeonly--;
-        }
-    else
+    //      ADC_FIRST is ADC channel 0, which is both PITCH and is also stored 
+    //      as part of our sample ring buffer.
+    if (which_adc == ADC_FIRST)
     {
-        //chargeonly = 0;            // use chargeonly if your input drivers are weak
-        if (adc_inverted[which_adc])
-            cvdata [which_adc] =  ((unsigned long)4096) - ADC1BUF0;
-        else
-            cvdata [which_adc] = ADC1BUF0;
-        which_adc++;
+        //   Note we store this in 12 bit (0-4096) mode; when we do our
+        //   windowing multiply we get it out to 16 bits
+        pbuf[pbindex] = ((unsigned long) 4096 ) - ADC1BUF0 ;
+        if (PORTBbits.RB9 == 0) {pbindex++; };   // is SYNC / FREEZE on or off?
+        if (pbindex >= PBUF_LEN) pbindex = 0;
     }
-#else
     if (adc_inverted[which_adc])
         cvdata [which_adc] =  ((unsigned long)4096) - ADC1BUF0;
     else
         cvdata [which_adc] = ADC1BUF0;
     which_adc++;
-#endif
+
     //  NEXT LINE:  when only unipolar inverted inputs are available, use next line.
     //   ADC1BUF is in range 2048-4096
     //cvdata[which_adc] = (4096 - ADC1BUF0) * 2;
@@ -285,35 +274,32 @@ void __attribute__((__interrupt__,__auto_psv__)) _DAC1RInterrupt(void)
 
     IFS4bits.DAC1RIF = 0;             //    clear the interrupt
 
-    //    CVPITCHINCR now gets calculated in the mainline ?  used to do it here
+    //    CVPITCHINCR could also be calculated in the mainline.  We used to do it here
     //    but it ate too much CPU and slowed down the ADC interrupt.
-//#define INTERRUPT_CURPITCHINCR
-#ifdef INTERRUPT_CURPITCHINCR
-    curpitchval = cvpitchknob + ( ( cvpitch) - 2048) ;
-    //   use exp_table to get exp freq resp.
-    curpitchincr = exp_table [
-            (curpitchval < 0) ? 0 :
-                (curpitchval > 0x0FFF) ? 0x0FFF : curpitchval];
-#endif
+    //
     //        MIDI and Frequency to curfreqincr conversion NOTES:
     //        MIDI note 0 = 8.1757 Hz.  MIDI note 127 = 12543 Hz
     //     use 23616894 for 83333 sample rate and 440 Hz out = MIDI note 69 +/- 0.1%
     // UNCOMMENT NEXT LINE FOR A-440 frequency output
     //curpitchincr = 23599607 ;
 
-    curbasephase = curbasephase + curpitchincr;
+    curbasephase = curbasephase + curpitchincr ;
+    //curbasephase = curbasephase + 1000;
 
-
-    //   Calculate the linear frequency modulation.  Used to do it here,
+    //   Calculate the linear frequency modulation.  Used to do it here at interrupt,
     //   now do it in the mainline to speed up the interrupt.
+//#define INTERRUPT_CURFREQMOD
+//#ifdef INTERRUPT_CURFREQMOD
+//    curfreqmod = cvfmknob * (cvfm- 2048) << 5;
+//    //    Output RB6 high if we have negative frequency
+//    TRISBbits.TRISB6 = curpitchincr + curfreqmod < 0 ? 0 : 1;
+//#endif
+
+    //   Add in linear frequency to the pitch base phase.
 //#define INTERRUPT_CURFREQMOD
 #ifdef INTERRUPT_CURFREQMOD
     curfreqmod = cvfmknob * (cvfm- 2048) << 5;
-    //    Output RB6 high if we have negative frequency
-    TRISBbits.TRISB6 = curpitchincr + curfreqmod < 0 ? 0 : 1;
 #endif
-
-    //   Add in linear frequency to the pitch base phase.
     curbasephase = curbasephase + curfreqmod;
 
 
@@ -330,18 +316,21 @@ void __attribute__((__interrupt__,__auto_psv__)) _DAC1RInterrupt(void)
     //   feedback, and used to generate the final (actual) FM phase.
     //   Because it's synchronous with curbasephase, we *do* calculate it at
     //   interrupt time (fortunately, it's fast)
-    sinevalue = sine_table [0x0000FFF & (curbasephase >> 20)] ;
+    sinevalue = _SINE_SAMPLE ? 
+         pbuf[0x00000FFF & (curbasephase >> 20)]
+        : sine_table [0x00000FFF & (curbasephase >> 20)] ;
 
     //   Used to calculate curphasemod here, but now do it in mainline (again, to
     //   minimize time spent in the interrupt and thus not slow down the ADC stream)
 //#define INTERRUPT_CURPHASEMOD
-#ifdef INTERRUPT_CURPHASEMOD
-    curphasemod = (((cvpm - 2048) * cvpmknob) >> 12);
-                //+ ((curphasemod ) / 2);
-    //   Output RB7 driven high if we have negative phase
-    TRISBbits.TRISB7 = curpitchincr + (curphasemod << 13) < 0 ? 0 : 1 ;
-#endif
+//#ifdef INTERRUPT_CURPHASEMOD
+//    curphasemod = (((cvpm - 2048) * cvpmknob) >> 12);
+//                //+ ((curphasemod ) / 2);
+//    //   Output RB7 driven high if we have negative phase
+//    TRISBbits.TRISB7 = curpitchincr + (curphasemod << 13) < 0 ? 0 : 1 ;
+//#endif
 
+//    This next version works but it's not very feature-rich...
 #ifdef WORKING_VERSION
     final_phase_fm = 0x0000FFF &
                     (
@@ -359,6 +348,7 @@ void __attribute__((__interrupt__,__auto_psv__)) _DAC1RInterrupt(void)
     DAC1LDAT = sine_table [0X00000fff & (final_phase_fm + 2048)];
     return;
 #endif
+
     //
     //   Slightly experimental version.   FM + Feedback on one, FM+PM+FB on other
     final_phase_fm_feedback = 0x00000FFF &
@@ -366,24 +356,62 @@ void __attribute__((__interrupt__,__auto_psv__)) _DAC1RInterrupt(void)
                         (
                             (curbasephase >> 20)    //  native base phase
                                 +                       // plus operator feedback
-                            ( (sinevalue - 32767 ) * ((cvfbknob * cvfb) >> 12) >> 12)
+                            (((sinevalue - 32767 ) * curfbgain) >> 12)
                          )
                     );
-    final_phase_fm = 0x00000FFF &
+    //    Calculate the phase modulation.   Can do here or baseline.
+#define INTERRUPT_CURPHASEMOD
+#ifdef INTERRUPT_CURPHASEMOD
+    curphasemod = (((cvpm - 2048) * cvpmknob) >> 10);
+    curaltphasemod = ((cvpm - 2048) * cvpmknob) + 256;
+#endif
+    final_phase_fm_fb_pm = 0x00000FFF &
                     (
-                        (                            // native base phase
-                            ( curbasephase >> 20)
-                                +                             //  plus operator feedback
-                            ( (sinevalue - 32767) * ((cvfbknob * cvfb)>> 12) >> 12)
+                         // native base phase
+                             final_phase_fm_feedback
                             +
-                            ( curphasemod  )
-                        )
+                             (_PHASEMOD ?  0 : curphasemod)
                     );
 
     //   All done - stuff the DAC output registers.
     //   WAS::  DAC1RDAT = sine_table [0x00000FFF & ((curbasephase >> 20) + 2048)];
-    DAC1RDAT = sine_table [0x00000FFF & (final_phase_fm_feedback + 2048)];
-    DAC1LDAT = sine_table [0X00000fff & (final_phase_fm + 2048)];
+    DAC1RDAT = sine_table [0x00000FFF & final_phase_fm_feedback];
+    //DAC1LDAT = sine_table [0X00000fff & final_phase_fm_fb_pm];
+
+    //   CAUTION: FEATURE CREEP AHEAD!
+    //    Next section calculates the DAC1L output.  This can be
+    //    from the sine table or the incoming sample, and then
+    //    phase modulated, or resolution reduced,
+    {
+        unsigned int fpffp, fpffpp, dist1, dist2;
+        fpffp = 0xfff & (final_phase_fm_fb_pm);
+        fpffpp = 0xfff & (final_phase_fm_fb_pm + 2048);
+        //   dist is the distance between read and write point, range is 0-2048
+        //  
+        dist1 = (abs (fpffp - pbindex));
+        dist1 = (dist1 ) > 256 ?  16 : (dist1 >> 4);
+        // dist1 = 256;
+        dist2 = 16 - dist1;
+        dac1la = _SINE_SAMPLE ?
+            pbuf [fpffp] * dist1
+            //+ 2048 * (16 - dist1)
+            + pbuf [(fpffpp)] * dist2
+            : sine_table [0X00000fff & (final_phase_fm_fb_pm + 2048)];
+        //dac1lb =  dac1la ^ ( (curaltphasemod > 0? curaltphasemod : -curaltphasemod) >> 8) ;
+        //   Next step:  decimation / resolution reduction - uses integer divide
+        //   then multiply by same amount to reduce the resolution.
+        dac1lb = (((dac1la - 32768) / ((curaltphasemod)>>8))
+                * ((curaltphasemod)>>8))
+                + 32768;
+        DAC1LDAT = _PHASEMOD ? dac1lb : dac1la;
+    }
+    //   and hard sync out - tried doing this in base loop, too much jitter.
+    //    Note that Hard Sync IN changes if we're in granular/sampling mode to
+    //    become _FREEZE_INPUT_SAMPLES_
+    if (_SINE_SAMPLE)
+    {  PORTBbits.RB8 = pbindex < 0x000000FF; }
+    else
+    {  PORTBbits.RB8 =  final_phase_fm_feedback > 0x00000800; }
     return;
 
 }
@@ -409,11 +437,11 @@ int main(int argc, char** argv) {
     //   Current crystal is 4 MHz so the below actually clocks at 41 MIPS
     //  Yeah overclocking!!!   Set PLLFBD to 79 for an accurate 40 MIPS.
     //   which is 80 MHz on the PLL clock output
-      CLKDIVbits.PLLPRE=0;      // N2=2
-      PLLFBD = 80 ;         // Set this to 79 for an accurate 80 mips
-      CLKDIVbits.PLLPOST=0;     // N1=2
+      CLKDIVbits.PLLPRE=0;		// N2=2
+      PLLFBD = 80 ;			// Set this to 79 for an accurate 80 mips
+      CLKDIVbits.PLLPOST=0;		// N1=2
                                         //  4MHz xtal + 0/80/0 yields ~40 MHz inst speed (measured)
-//    OSCTUN=0;             // Tune FRC oscillator, if FRC is used
+//    OSCTUN=0;				// Tune FRC oscillator, if FRC is used
 
     // Disable Watch Dog Timer
       RCONbits.SWDTEN=0;
@@ -421,7 +449,7 @@ int main(int argc, char** argv) {
     // Wait for PLL to lock
     while(OSCCONbits.LOCK!=1) {};
 
-    //   Set up aux oscillator for the DAC
+    //   Set up aux oscillator channel
     ACLKCONbits.SELACLK = 0;    //   Aux oscillator from Main Fosc;
     ACLKCONbits.APSTSCLR = 6;   //  was 6: Divide by 2 - gets 20 MHz to the DAC;
                                 //  use 6 to get 83333 hz DAC output rate (measured @ 40 MHz inst)
@@ -430,14 +458,16 @@ int main(int argc, char** argv) {
     long int quantum;
     zig = 0;
     iz = 0;
-    
-     // mode / buttons states
+
+    // mode / buttons states
+
     _PHASEMOD = 0x1; 
     _SINE_SAMPLE = 0x1;
     prevStateRA4 = 0x1;
     prevStateRB4 = 0x1;
     cnt_sw = 0x0; 
-                     //  0x1 = ~ 1/15 Hz (1 cycle per 15 seconds)
+
+                        //  0x1 = ~ 1/15 Hz (1 cycle per 15 seconds)
     quantum = 0x2400;   //  0x24000 = ~ 10 KHz; 0x35000 =~ 15 KHz
 
 
@@ -445,22 +475,25 @@ int main(int argc, char** argv) {
     TRISA = 0x0;    //   Inputs on RA0-1 (ADC 0 and 1)
     TRISAbits.TRISA0 = 1;
     TRISAbits.TRISA1 = 1;
-    TRISAbits.TRISA4 = 1;   //  RA4 is switch #1
-    
+    TRISAbits.TRISA4 = 1;   //  RA4 is switch 3
+    //TRISAbits.TRISA8 = 1;   //  RA8 is switch 1 // unused
+
     TRISC = 0x0;    //   Inputs on RC0-1 (ADC 6 and 7)
     TRISCbits.TRISC0 = 1;
     TRISCbits.TRISC1 = 1;
 
-    TRISB = 0x0;    //   Inputs on RB0-3 (ADC 2,3,4,5), RB4,9 (switches); RB12-15 (DACs)
+    TRISB = 0x0;    //   Inputs on RB0-3 (ADC 2,3,4,5), RB8-9 (switches)RB12-15 (DACs)
     TRISBbits.TRISB0 = 1;
     TRISBbits.TRISB1 = 1;
     TRISBbits.TRISB2 = 1;
     TRISBbits.TRISB3 = 1;
-    TRISBbits.TRISB4 = 1;   //  RB4 is switch #2
-   // Pins RB6, and RB7 are the LED ports, RB5 is unused
+    TRISBbits.TRISB4 = 1;  //  RB4 is switch 2
+    // RB6, and RB7 are the LED ports 
+    // TRISBbits.TRISB5 = 0;  //  RB5 unused
+    // PORTBbits.RB5 = 1;
     TRISBbits.TRISB6 = 0;  //  RB6 is heartbeat
     PORTBbits.RB6 = 1;
-    TRISBbits.TRISB7 = 0;  //  RB7 is negative frequency
+    TRISBbits.TRISB7 = 0;  //  RB7 is negative phase
     PORTBbits.RB7 = 1;
     TRISBbits.TRISB8 = 0;  //   Pin RB8 is SYNC OUT,
     TRISBbits.TRISB9 = 1;  //   Pin RB9 is SYNC IN.
@@ -474,11 +507,11 @@ int main(int argc, char** argv) {
     TRISCbits.TRISC7 = 0;
 
     //   Set up the DACs
-    DAC1CONbits.DACEN = 1;  // enable the audio dac
-    DAC1CONbits.AMPON = 1;  // enable the output amplifier
-    DAC1CONbits.FORM = 0;   //  unsigned data (0 = unsigned data)
-    DAC1CONbits.DACFDIV = 3; // divide Fosc to drive interpolator. 3 = 83.333KHz @40MIPS
-    DAC1STAT = 0xFFFF;    //  everything on
+    DAC1CONbits.DACEN = 1;    // enable the audio dac
+    DAC1CONbits.AMPON = 1;    // enable the output amplifier
+    DAC1CONbits.FORM = 0;     //  unsigned data (0 = unsigned data)
+    DAC1CONbits.DACFDIV = 6;  // (was 3) divide Fosc to drive interpolator. 3 = 83.333KHz @40MIPS
+    DAC1STAT = 0xFFFF;        //  everything on
     DAC1STATbits.LITYPE = 1;  // 0 means interrupt on Left LIFO not full
     DAC1STATbits.RITYPE = 1;  // 0 means interrupt on Right LIFO not full
     DAC1STATbits.LMVOEN = 0;  //  left channel midpoint output off
@@ -504,7 +537,7 @@ int main(int argc, char** argv) {
     AD1CON2bits.ALTS = 0;      //  always use sample A
 
     //   ADC clock must nominally be at least 117 nS long per cycle
-    AD1CON3bits.ADCS = 4;      // (was 7)  divide 80 mHz by this plus 1
+    AD1CON3bits.ADCS = 4;      // (was 7, then 4)  divide 80 mHz by this plus 1
     AD1CON3bits.ADRC = 0;      // was 1: 1=use the ADC's internal RC clock
     AD1CON3bits.SAMC = 1;      //  Auto sample time bits (ignored here)
 
@@ -530,6 +563,9 @@ int main(int argc, char** argv) {
             cvdata[i] = 0;
     }
 
+    //   Zero the buffer index for starters.
+    pbindex = 0;
+
     AD1CON1bits.ADON = 1;      //  turn on the AD converter itself.
     which_adc = ADC_FIRST;  //  start at the first ADC
     AD1CON1bits.DONE = 0;      //  clear DONE bit.
@@ -550,15 +586,14 @@ int main(int argc, char** argv) {
     //      interrupts.   Things like calculations of various things that are
     //       dependent on the ADC and are needed every DAC tick but don't
     //        necessarily have to change every DAC tick are calculated here.
-    //     These are things like the RB6 "heartbeat" LED, RB7 neg Freq.
+    //     These are things like the RB6 "hearbeat" LED, RB7 neg frequency,
     //     RB8 and RB9 hard sync in and hard sync out, and the internals:
     //     curpitchval, curpitchincr, and curphasemod.
     //
     while (1)   // Loop Endlessly - Execution is interrupt driven
     {
-
-        //PORTBbits.RB5 = 1;   // DEBUG
-        //PORTBbits.RB6 = 0;   // DEBUG
+        
+//PORTBbits.RB6 = 0;   // DEBUG
 //#define HEARTBEAT_CPU
 #ifdef HEARTBEAT_CPU
         iz++;
@@ -566,22 +601,39 @@ int main(int argc, char** argv) {
                                              // each flash = ~3 MIP of slack
 #endif
 
+#define NON_LATCHING
+#ifdef NON_LATCHING
+        if (cnt_sw++ > _CHECK)
+        {
+            char _switch = PORTAbits.RA4; 
+            if (prevStateRA4 && !_switch) _PHASEMOD = ~_PHASEMOD & 1u; // toggle phase mod / resolutuion grinding
+            prevStateRA4 = _switch;
+
+            _switch = PORTBbits.RB4;
+            if (prevStateRB4 && !_switch) _SINE_SAMPLE = ~_SINE_SAMPLE & 1u; // toggle sine / sample
+            prevStateRB4 = _switch;
+
+            cnt_sw = 0x0; // reset counter
+        }
+        //if (UI && cnt_ui++ > _UI_TIMEOUT) UI = cnt_ui = 0x0; // return to normal
+        // ... some sequence like ? : off / on / off
+#endif
+
 #define HEARTBEAT_WAVEPHASE
 #ifdef HEARTBEAT_WAVEPHASE
         //int bitson[16] = { 0,1,0,1,1,1,0,1,0,1,0,1,0,0,0,1 };
         iz++;
         //   Turns out that if you just toggle a bit fast the LED doesn't
-        //   respond AT ALL (capacitance issues; the voltage never gets high
+        //   respond AT ALL (RC issues - the 220 ohm ballast resistance and the LED's
+        //   capacitance form an RC filter and the output voltage never gets high
         //   enough to turn on the LED).  So we use TRIS (tristate) instead.
-        // PORTBbits.RB6 =  0x3FF > (0x00000FFF & (curbasephase >> 20 ));
-        PORTBbits.RB6 = 1;
-        TRISBbits.TRISB6 = 0x3FF < (0x00000FFF & (curbasephase >> 20 ));
-        if (_PHASEMOD) // test / toggle led #2
-        {
-            PORTBbits.RB7 = 1;
-            TRISBbits.TRISB7 = 0x3FF < (0x00000FFF & (curbasephase >> 20 ));
-        }
-        //TRISBbits.TRISB6 = bitson [ 0x0F & (curbasephase >> 28)];
+        //  PORTBbits.RB6 =  0x3FF > (0x00000FFF & (curbasephase >> 20 ));
+        //  PORTBbits.RB6 = 1;
+        //      Use this to test switch inputs like RA8, RB4, RA4
+        //TRISBbits.TRISB5 = PORTAbits.RA8;
+        //      Use this for normal operation (on in first 1/2 of wave)
+        TRISBbits.TRISB6 = 0x7FF < (0x00000FFF & (curbasephase >> 20 ));
+        // TRISBbits.TRISB6 = bitson [ 0x0F & (curbasephase >> 28)];
 #endif
 
 //#define HEARTBEAT_NOTINTERRUPT
@@ -590,75 +642,75 @@ int main(int argc, char** argv) {
         PORTCbits.RC7 = 0;
 #endif
 
-#define NON_LATCHING
-#ifdef NON_LATCHING
-      
-       if (cnt_sw++ > _CHECK)
-       {
-            char _switch = PORTAbits.RA4; 
-            if (prevStateRA4 && !_switch) _PHASEMOD = ~_PHASEMOD & 1u; // toggle phase mod / resolution grinding
-            prevStateRA4 = _switch;
 
-            _switch = PORTBbits.RB4;
-            if (prevStateRB4 && !_switch) _PHASEMOD = ~_PHASEMOD & 1u; // _SINE_SAMPLE = ~_SINE_SAMPLE & 1u; // toggle sine / sample
-            prevStateRB4 = _switch;
-
-            cnt_sw = 0x0; // reset counter
-       }
-        //if (UI && cnt_ui++ > _UI_TIMEOUT) UI = cnt_ui = 0x0; // return to normal
-        // ... some sequence like ? : off / on / off
-#endif
-        
 #define BASELINE_CVPITCHINCR
 #ifdef BASELINE_CVPITCHINCR
-    curpitchval = cvpitchknob + ( ( cvpitch) - 2048) ;
-    //   use exp_table to get exp freq resp.
-    curpitchincr = exp_table [
-            (curpitchval < 0) ? 0 :
-                (curpitchval > 0x0FFF) ? 0x0FFF : curpitchval];
+    curpitchval = cvpitchknob + (_SINE_SAMPLE ? 0 : ( ( cvpitch) - 2048)) ;
+    //   use exp_table to get exp freq resp, or if RA8 is turned off
+    //   then we're in LFO mode and we use the value directly (linear, very low
+    //   frequency).
+    curpitchincr = // PORTAbits.RA8 ? // unused
+        ((exp_table [
+          (curpitchval < 0) ? 0 :
+            (curpitchval > 0x00000FFF) ? 0x00000FFF : curpitchval]) >> 12);
+        //:
+        //(exp_table [
+        //  (curpitchval < 0) ? 0 :
+        //    (curpitchval > 0x00000FFF) ? 0x00000FFF : curpitchval]);
 
 #endif
 
+    //   We can calculate linear frequency modulation here.
 #define BASELINE_CURFREQMOD
 #ifdef BASELINE_CURFREQMOD
     curfreqmod = cvfmknob * (cvfm- 2048) << 5;
-    //    Output RB7 high if we have negative frequency
-    //PORTBbits.RB7 = 1;
-    //TRISBbits.TRISB7 = curpitchincr + curfreqmod < 0 ? 0 : 1;
+    //    Output RB7 high if we have negative frequency.  Note because
+    //    of capacitance issues, we ALWAYS have RB7 on, but rather
+    //    just turn on and off the tristate (TRISbits) for RB7
+    PORTBbits.RB7 = 1;
+    TRISBbits.TRISB7 = curpitchincr + curfreqmod < 0 ? 0 : 1;
 #endif
+
+//#define BASELINE_CURPHASEMOD
+#ifdef BASELINE_CURPHASEMOD
+    curaltphasemod = ((cvpm - 2048) * cvpmknob) + 256;
+    curphasemod = (((cvpm - 2048) * cvpmknob) >> 10);
+#endif
+    //+ ((curphasemod ) / 2);
+    //   Output RB7 driven high if we have negative phase.   Note that
+    //   because of capacitance issues, we can't just output the bit; we
+    //   have to change the tristate (TRISbits) to hi-Z the output.
+    // PORTBbits.RB7 = 1;
+    // TRISBbits.TRISB7 = curpitchincr + (curphasemod << 13) < 0 ? 0 : 1 ;
+
 
 #define BASELINE_HARDSYNC
 #ifdef BASELINE_HARDSYNC
     //   Do we have a HARD SYNC IN request on pin RB9?
     //   GROT GROT GROT note that this hacky hysteresis could / should
     //   really be done in an interrupt.  Maybe later....
-    if (PORTBbits.RB9 == 0 ) // high -> low 
+    if (PORTBbits.RB9 == 1 )
     {
-        if (oldhardsync == 1)
+        if (oldhardsync == 0)
         {
-            curbasephase = 0; 
-            oldhardsync = 0;
+            curbasephase = 0;
+            oldhardsync = 1;
         }
     }
     else
-        oldhardsync = 1;
+        oldhardsync = 0;
 
-    //   And output hard sync out on RB9.
-    //PORTBbits.RB9 = ((0x00000FFF &
-    //            (final_phase_fm - (27 * (curbasephase >> 20)))) >> 10) == 0;
-    PORTBbits.RB8 =  final_phase_fm_feedback > 0x00000800;
+    //   And output hard sync out on RB8.
+    //  this used to happen (and cound again happen) at interrupt time.
+    //
+    //PORTBbits.RB8 =  final_phase_fm_feedback < 0x00000800;
 
 #endif
 
-#define BASELINE_CURPHASEMOD
-#ifdef BASELINE_CURPHASEMOD
-    curphasemod = (((cvpm - 2048) * cvpmknob) >> 10);
-                //+ ((curphasemod ) / 2);
-    //   Output RB7 driven high if we have negative phase
-    //PORTBbits.RB7 = 1;
-    //TRISBbits.TRISB7 = curpitchincr + (curphasemod << 13) < 0 ? 0 : 1 ;
+#define BASELINE_CURFBGAIN
+#ifdef BASELINE_CURFBGAIN
+    curfbgain = (cvfb * cvfbknob) >> 12;
 #endif
-
     //
         //PORTBbits.RB6 = ! (PORTBbits.RB6);     // <<- 16 instructions counting the loop branch
 
